@@ -1,0 +1,14 @@
+{
+  "scope": "local read-only analytics API; not audio or production capacity",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "python": "3.13.5",
+  "synthetic_meetings": 3,
+  "requests": 200,
+  "concurrency": 4,
+  "successes": 200,
+  "failures": 0,
+  "elapsed_seconds": 0.045,
+  "requests_per_second": 4469.92,
+  "p50_ms": 0.58,
+  "p95_ms": 1.766
+}

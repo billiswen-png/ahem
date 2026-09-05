@@ -1,0 +1,16 @@
+{
+  "server_before_pid": 11308,
+  "server_after_pid": 11713,
+  "http_status": 200,
+  "recovery_seconds": 0.232,
+  "backup_exit_code": 0,
+  "backup_runs": 2,
+  "backup_interval_seconds": 3600,
+  "verified_backup_count": 2,
+  "verified_meetings_per_backup": [
+    3,
+    3
+  ],
+  "reboot_tested": false,
+  "note": "LaunchAgents run after macOS user login; no physical reboot was performed."
+}
