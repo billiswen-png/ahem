@@ -18,7 +18,7 @@ def main():
     with sync_playwright() as p:
         browser=p.chromium.launch(channel=args.channel)
         for role in ['manager','operator','observer','support','content-officer','viewer']:
-            context=browser.new_context(viewport={'width':1440,'height':1000})
+            context=browser.new_context(viewport={'width':1536,'height':1024})
             page=context.new_page();errors=[];console=[]
             page.on('pageerror',lambda e:errors.append(str(e)))
             page.on('console',lambda m:console.append(m.text) if m.type=='error' and '401' not in m.text else None)
@@ -29,8 +29,8 @@ def main():
                 page.set_viewport_size({'width':390,'height':844})
                 page.screenshot(path=str(args.output/'login-mobile.png'),full_page=True)
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
-                page.set_viewport_size({'width':1440,'height':1000})
-            for asset in ['login-background.png','roles-and-states.png']:
+                page.set_viewport_size({'width':1536,'height':1024})
+            for asset in ['login-background-v2.png','roles-and-states-v2.png']:
                 assert page.request.get(args.url+'/ui/assets/'+asset).status==200
             page.get_by_label('存取憑證').fill(ids[role]['token'])
             page.get_by_role('button',name='進入工作台').click()
@@ -73,14 +73,17 @@ def main():
                 expect(page.locator('.transcript')).to_contain_text('先回到第二季上線排程')
             assert errors==[],errors
             assert console==[],console
+            page.evaluate('window.scrollTo(0,0)')
             page.screenshot(path=str(args.output/f'{role}.png'),full_page=True)
             results[role]={'page_errors':len(errors),'console_errors':len(console),'screenshot':f'{role}.png','status':'pass'}
-            if role=='manager':
+            if role in {'manager','operator'}:
                 page.set_viewport_size({'width':390,'height':844})
-                page.screenshot(path=str(args.output/'manager-mobile.png'),full_page=True)
+                page.evaluate('window.scrollTo(0,0)')
+                page.screenshot(path=str(args.output/f'{role}-mobile.png'),full_page=True)
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.get_by_role('button',name='登出',exact=True).click()
             page.get_by_label('存取憑證').wait_for()
+            expect(page.locator('#sidebar')).to_be_hidden()
             context.close()
         browser.close()
     (args.output/'browser-results.json').write_text(json.dumps(results,indent=2))

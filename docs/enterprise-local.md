@@ -2,6 +2,11 @@
 
 ## 後台 UI 整合
 
+目前 UI 已更新為 v2：白底／冷灰側欄／靛紫操作、固定側邊導覽與手機頂部導覽。
+新素材、原始提示詞和設計決策見 [enterprise-assets-v2](design/enterprise-assets-v2/README.md)。
+實際新增 `theme-v2.css`，保留v1基礎控制樣式；下方v1素材紀錄為先前版本。
+本次結果位於 repo 外 `../outputs/enterprise-ui-v2/README.md`。
+
 登入頁已使用 `enterprise_ui/assets/login-background.png`；登入後按真實角色顯示
 `roles-and-states.png` 的對應插畫。按鍵是 HTML/CSS，不使用生成圖片當可點擊熱區。
 延續米白／深藍／霧金素材配色；未新增第三方登入或前端自行切換角色。

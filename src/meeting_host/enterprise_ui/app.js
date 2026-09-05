@@ -20,6 +20,7 @@ function signedOut() {
  identity = null;
  $('#workspace').hidden = true; $('#login').hidden = false; $('#logout').hidden = true;
  $('#panel').replaceChildren(); $('#token').value = '';
+ document.body.classList.remove('authenticated'); $('#sidebar').hidden = true; $('#context').hidden = true;
 }
 async function api(path, body, method) {
  const response = await fetch('/api/' + path, {
@@ -65,11 +66,15 @@ function table(headers, rows) {
 async function start() {
  identity = await api('me');
  $('#login').hidden = true; $('#workspace').hidden = false; $('#logout').hidden = false;
+ document.body.classList.add('authenticated'); $('#sidebar').hidden = false; $('#context').hidden = false;
  $('#context').textContent = identity.tenant + ' / ' + (identity.regulated_content ? '受限內容管理' : roles[identity.role]);
  $('#role-art').className = identity.regulated_content ? 'cleared' : identity.role;
  const tabs = identity.role === 'operator' ? ['analytics','meetings','health','audit'] : identity.role === 'support' ? ['health'] : identity.role === 'viewer' ? ['meetings'] : ['analytics'];
  current = tabs[0];
- $('#nav').replaceChildren(...tabs.map(t => button(labels[t],async () => { current=t; await render(); })));
+ $('#nav').replaceChildren(...tabs.map(t => {
+  const b = button(labels[t],async () => { current=t; await render(); });
+  b.prepend(navIcon(t)); return b;
+ }));
  await render();
 }
 $('#login-form').onsubmit = async e => {
@@ -208,5 +213,17 @@ async function grants(m) {
    if(epoch===revision && pane.isConnected)await grants(m);
   },a.granted?'danger':undefined));pane.append(row);
  }
+}
+function navIcon(kind) {
+ const paths = {
+  analytics:['M5 20V12','M12 20V4','M19 20V8'],
+  meetings:['M6 10V7a6 6 0 0 1 12 0v3','M5 10h14v11H5z','M12 14v3'],
+  health:['M2 12h4l3-8 5 16 3-8h5'],
+  audit:['M8 3H5v18h14V3h-3','M9 2h6v4H9z','M8 10h8','M8 14h8','M8 18h5']
+ };
+ const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+ for(const [k,v] of Object.entries({viewBox:'0 0 24 24',fill:'none',stroke:'currentColor','stroke-width':'1.7','stroke-linecap':'round','stroke-linejoin':'round','aria-hidden':'true',focusable:'false'}))svg.setAttribute(k,v);
+ for(const d of paths[kind]){const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d',d);svg.append(path);}
+ return svg;
 }
 start().catch(e => { if(identity)error(e); });
