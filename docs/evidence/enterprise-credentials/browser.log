@@ -1,0 +1,1 @@
+PASS: create, masked one-time credential, login, rotate, old-key/session rejection, new-key login, suspension, desktop/mobile; zero page/console errors; EXIT_CODE=0

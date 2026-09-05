@@ -157,16 +157,40 @@ function paginate(pane,data){
  bar.append(prev,el('span',`共 ${data.total_count} 筆 · 第 ${Math.floor(data.offset/data.limit)+1} 頁`),next);pane.append(bar);
 }
 function renderMembers(pane,data){
- pane.append(el('p','停用會阻擋後續登入並撤銷現有工作階段；恢復後原憑證可再次登入。不可停用自己。單純終止工作階段不會停用憑證。','small'));
+ pane.append(el('p','限時憑證須由管理員透過安全管道交付；沒有自動寄送 Email。恢復成員不會延長到期憑證；輪替不會解除停用。','small'));
+ pane.append(button('新增限時成員',()=>credentialForm(),'secondary'));
  pane.append(table(['成員','角色','受限內容許可','登入中','操作'],data.members.map(a=>{
- const actions=el('div',undefined,'actions');actions.append(el('span',a.enabled?'已啟用':'已停用'));
- if(a.can_manage)actions.append(button(a.enabled?'停用成員':'恢復成員',async()=>{
-  if(confirm(a.enabled?'停用此成員並撤銷登入？':'恢復此成員，原憑證將可重新登入？')){await api('members/status',{actor:a.id,enabled:!a.enabled});await render();}
- },a.enabled?'danger':'secondary'));
+ const actions=el('div',undefined,'actions');actions.append(el('span',a.suspended?'已停用':a.enabled?'已啟用':'憑證已到期'));
+ if(a.credential_expires_at)actions.append(el('span','憑證到期：'+new Date(a.credential_expires_at*1000).toLocaleString(),'small'));
+ if(a.can_manage)actions.append(button(a.suspended?'恢復成員':'停用成員',async()=>{
+  if(confirm(a.suspended?'恢復此成員？到期憑證仍需輪替。':'停用此成員並撤銷登入？')){await api('members/status',{actor:a.id,enabled:a.suspended});await render();}
+ },a.suspended?'secondary':'danger'),button('輪替憑證',()=>credentialForm(a),'secondary'));
  actions.append(button('終止工作階段',async()=>{
   if(!confirm('終止此成員的所有登入工作階段？不會停用憑證。'))return;
   await api('members/revoke-sessions',{actor:a.id});await render();
  },'danger'));return [a.id,roles[a.role],a.regulated_content?'有':'無',a.sessions,actions];})));
+}
+function credentialForm(member){
+ const pane=detailPane(member?'輪替成員憑證':'新增限時成員'),form=el('form',undefined,'import'),name=el('input'),days=el('input');
+ name.required=true;name.pattern='(?:[a-z0-9_]|-){3,48}';name.maxLength=48;name.value=member?.id||'';name.readOnly=!!member;
+ days.type='number';days.min=1;days.max=30;days.step=1;days.value=7;days.required=true;
+ const role=select([['viewer','與會閱覽'],['manager','主管統計'],['observer','觀察統計'],['support','客服維運']]);
+ const submit=el('button',member?'確認撤銷舊憑證':'產生限時憑證');submit.type='submit';
+ form.append(field('成員代碼',name),field('憑證有效天數',days));if(!member)form.append(field('新增成員角色',role));form.append(submit);pane.append(form);
+ pane.append(el('p','使用不含個資的代碼。此介面不能建立管理員或授予受限內容許可。輪替立即撤銷舊憑證與登入工作階段。','small'));
+ form.onsubmit=async e=>{
+  e.preventDefault();if(submit.disabled)return;
+  if(member&&!confirm('立即使此成員的舊憑證與登入失效？'))return;
+  submit.disabled=true;const epoch=revision;
+  try{
+   const result=await api('members/'+(member?'rotate':'create'),{actor:name.value,role:role.value,days:Number(days.value)});
+   if(epoch!==revision||!identity||!pane.isConnected)return;
+   pane.replaceChildren(el('h2','憑證僅顯示這一次'),el('p','請私下交付。兩分鐘後此畫面會清除；遺失時需再次輪替，不可查回明文。','small'));
+   const token=el('input');token.type='password';token.readOnly=true;token.value=result.token;token.autocomplete='off';
+   pane.append(field('新存取憑證',token),button('顯示／隱藏',()=>{token.type=token.type==='password'?'text':'password';},'secondary'),button('我已保存，關閉',async()=>{token.value='';pane.remove();await render();}));
+   setTimeout(()=>{token.value='';pane.remove();},120000);
+  }catch(e){if(epoch===revision)error(e);}finally{submit.disabled=false;}
+ };
 }
 function renderTrends(pane,data){
  pane.append(el('p',`有 ${data.unknown_import_dates} 場舊資料缺少匯入時間，未納入下表；刪除或到期後也不再計入。此表不是效率評分。`,'small'));

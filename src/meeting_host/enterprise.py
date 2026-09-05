@@ -88,6 +88,7 @@ class Workspace:
           PRIMARY KEY(tenant,component));
         CREATE TABLE IF NOT EXISTS health_history (tenant TEXT, component TEXT, state TEXT, at REAL);
         CREATE TABLE IF NOT EXISTS disabled_members (actor TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS member_credentials (actor TEXT PRIMARY KEY, digest TEXT UNIQUE NOT NULL, profile TEXT NOT NULL, expires REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS meeting_imports (meeting TEXT PRIMARY KEY, at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS incidents (id TEXT PRIMARY KEY, tenant TEXT NOT NULL,
           component TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
@@ -97,6 +98,15 @@ class Workspace:
         CREATE INDEX IF NOT EXISTS audit_tenant_time ON audit(tenant,at);
         CREATE INDEX IF NOT EXISTS health_history_tenant_time ON health_history(tenant,at);
         ''')
+        # Database credentials supersede static bootstrap keys after rotation.
+        for row in self.db.execute('SELECT actor,digest,profile FROM member_credentials'):
+            profile=json.loads(row['profile'])
+            if profile['id'] != row['actor'] or profile['role'] not in ROLES:
+                raise ValueError('Invalid persisted identity')
+            self.identities={k:v for k,v in self.identities.items() if v['id'] != row['actor']}
+            if row['digest'] in self.identities:
+                raise ValueError('Duplicate credential digest')
+            self.identities[row['digest']]=profile
         self.store = EnvelopeStore(kek)
         self.sessions = {}
         self.attempts = {}
@@ -113,7 +123,20 @@ class Workspace:
         return None
 
     def disabled(self, actor):
-        return self.db.execute('SELECT 1 FROM disabled_members WHERE actor=?', (actor['id'],)).fetchone() is not None
+        expired=self.db.execute('SELECT expires FROM member_credentials WHERE actor=?',(actor['id'],)).fetchone()
+        return (expired is not None and expired[0] <= time.time()) or self.db.execute('SELECT 1 FROM disabled_members WHERE actor=?', (actor['id'],)).fetchone() is not None
+
+    def issue_credential(self, profile, days):
+        token=secrets.token_urlsafe(32)
+        digest=hashlib.sha256(token.encode()).hexdigest()
+        expires=time.time()+days*86400
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO member_credentials VALUES (?,?,?,?)',
+                (profile['id'],digest,json.dumps(profile),expires))
+        self.identities={k:v for k,v in self.identities.items() if v['id']!=profile['id']}
+        self.identities[digest]=dict(profile)
+        self.sessions={k:v for k,v in self.sessions.items() if v[0]['id']!=profile['id']}
+        return {'token':token,'expires_at':expires,'actor':profile['id']}
 
     def audit(self, actor, action, outcome):
         self.db.execute("INSERT INTO audit VALUES (?,?,?,?,?)", (time.time(), actor["tenant"],
@@ -401,9 +424,41 @@ def create_app(ws: Workspace, origin: str):
             ws.audit(actor, "revoke_sessions", "ok")
             return web.json_response({"ok": True})
         return web.json_response({"members": [dict(id=i["id"],role=i["role"],regulated_content=i.get("regulated_content") is True,
+            suspended=ws.db.execute('SELECT 1 FROM disabled_members WHERE actor=?',(i['id'],)).fetchone() is not None,
+            credential_expires_at=next((r[0] for r in ws.db.execute('SELECT expires FROM member_credentials WHERE actor=?',(i['id'],))),None),
             enabled=not ws.disabled(i), can_manage=i['id']!=actor['id'] and (not i.get('regulated_content') or actor.get('regulated_content') is True),
             sessions=sum(v[0]["id"] == i["id"] and v[1] > time.time() for v in ws.sessions.values()))
             for i in ws.identities.values() if i["tenant"] == actor["tenant"]]})
+
+    async def credentials(request):
+        actor=require(request, {'operator'})
+        body=await object_body(request)
+        days=body.get('days',7)
+        if type(days) is not int or not 1<=days<=30:
+            raise ValueError('Expected 1..30 days')
+        if request.path.endswith('/create'):
+            name=body.get('actor')
+            if not isinstance(name,str) or not 3<=len(name)<=48 or any(c not in 'abcdefghijklmnopqrstuvwxyz0123456789-_' for c in name):
+                raise ValueError('Use a non-sensitive lowercase member code')
+            if body.get('role') not in {'viewer','manager','observer','support'} or body.get('regulated_content'):
+                raise web.HTTPForbidden()
+            if any(i['id']==name for i in ws.identities.values()):
+                raise web.HTTPConflict(reason='Member code unavailable')
+            if len(ws.identities)>=1000:
+                raise web.HTTPConflict(reason='Local workspace identity limit reached')
+            target={'id':name,'tenant':actor['tenant'],'role':body['role'],'regulated_content':False}
+            action='member_create'
+        else:
+            target=next((i for i in ws.identities.values() if i['id']==body.get('actor') and i['tenant']==actor['tenant']),None)
+            if target is None:
+                raise web.HTTPNotFound()
+            if target['id']==actor['id'] or (target.get('regulated_content') and not actor.get('regulated_content')):
+                raise web.HTTPForbidden()
+            action='credential_rotate'
+        result=ws.issue_credential(target,days)
+        ws.audit(actor,action,'ok')
+        # Plaintext returned once; only a digest is persisted. Never log this response.
+        return web.json_response(result)
 
     async def trends(request):
         actor = require(request, {'operator','manager','observer'})
@@ -464,6 +519,7 @@ def create_app(ws: Workspace, origin: str):
         web.post('/api/meetings/{mid}/policy', policy), web.get('/api/members', members), web.post('/api/members/revoke-sessions', members),
         web.get('/api/health/history', history),
         web.post('/api/members/status', members), web.get('/api/trends',trends),
+        web.post('/api/members/create',credentials), web.post('/api/members/rotate',credentials),
         web.get('/api/incidents',incidents), web.post('/api/incidents',incidents), web.post('/api/incidents/{iid}',incidents),
         web.get('/api/health', health), web.post('/api/health', health), web.get('/api/audit', audit)])
     async def index(request):
