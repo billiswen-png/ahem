@@ -87,6 +87,11 @@ class Workspace:
         CREATE TABLE IF NOT EXISTS health (tenant TEXT, component TEXT, state TEXT, at REAL,
           PRIMARY KEY(tenant,component));
         CREATE TABLE IF NOT EXISTS health_history (tenant TEXT, component TEXT, state TEXT, at REAL);
+        CREATE TABLE IF NOT EXISTS disabled_members (actor TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS meeting_imports (meeting TEXT PRIMARY KEY, at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS incidents (id TEXT PRIMARY KEY, tenant TEXT NOT NULL,
+          component TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS incidents_tenant_updated ON incidents(tenant,updated);
         CREATE INDEX IF NOT EXISTS meetings_tenant_expiry ON meetings(tenant,expires,id);
         CREATE INDEX IF NOT EXISTS meetings_expiry ON meetings(expires);
         CREATE INDEX IF NOT EXISTS audit_tenant_time ON audit(tenant,at);
@@ -102,8 +107,13 @@ class Workspace:
         digest = hashlib.sha256(token.encode()).hexdigest()
         for expected, identity in self.identities.items():
             if hmac.compare_digest(expected, digest):
+                if self.disabled(identity):
+                    return None
                 return identity
         return None
+
+    def disabled(self, actor):
+        return self.db.execute('SELECT 1 FROM disabled_members WHERE actor=?', (actor['id'],)).fetchone() is not None
 
     def audit(self, actor, action, outcome):
         self.db.execute("INSERT INTO audit VALUES (?,?,?,?,?)", (time.time(), actor["tenant"],
@@ -116,6 +126,8 @@ class Workspace:
             self.db.execute("DELETE FROM meetings WHERE expires<=?", (time.time(),))
             self.db.execute("DELETE FROM audit WHERE at<?", (time.time()-90*86400,))
             self.db.execute("DELETE FROM health_history WHERE at<?", (time.time()-30*86400,))
+            self.db.execute("DELETE FROM meeting_imports WHERE meeting NOT IN (SELECT id FROM meetings)")
+            self.db.execute("DELETE FROM incidents WHERE status='resolved' AND updated<?", (time.time()-90*86400,))
 
     def ingest(self, actor, events, policy, days):
         if actor["role"] != "operator":
@@ -130,6 +142,7 @@ class Workspace:
         with self.db:
             self.db.execute("INSERT INTO meetings VALUES (?,?,?,?,?,?)", (mid, actor["tenant"], policy,
                 time.time()+days*86400, json.dumps(aggregate), blob))
+            self.db.execute("INSERT INTO meeting_imports VALUES (?,?)", (mid,time.time()))
         self.audit(actor, "import", "ok")
         return mid
 
@@ -144,7 +157,7 @@ def create_app(ws: Workspace, origin: str):
             raise ValueError("Expected object")
         if request.path != "/api/login":
             session = ws.sessions.get(request.cookies.get("enterprise", ""))
-            if not session or session[1] <= time.time():
+            if not session or session[1] <= time.time() or ws.disabled(session[0]):
                 raise web.HTTPUnauthorized()
         return body
 
@@ -162,7 +175,7 @@ def create_app(ws: Workspace, origin: str):
                 raise web.HTTPForbidden(reason="Origin rejected")
             if request.path.startswith("/api/") and request.path != "/api/login":
                 session = ws.sessions.get(request.cookies.get("enterprise", ""))
-                if not session or session[1] <= time.time():
+                if not session or session[1] <= time.time() or ws.disabled(session[0]):
                     raise web.HTTPUnauthorized()
                 request[ACTOR] = session[0]
             response = await handler(request)
@@ -374,12 +387,64 @@ def create_app(ws: Workspace, origin: str):
                 raise web.HTTPNotFound()
             if target.get("regulated_content") is True and actor.get("regulated_content") is not True:
                 raise web.HTTPForbidden()
+            if request.path.endswith('/status'):
+                enabled = body.get('enabled')
+                if type(enabled) is not bool or target['id'] == actor['id']:
+                    raise ValueError('Cannot change own status')
+                with ws.db:
+                    if enabled:
+                        ws.db.execute('DELETE FROM disabled_members WHERE actor=?',(target['id'],))
+                    else:
+                        ws.db.execute('INSERT OR IGNORE INTO disabled_members VALUES (?)',(target['id'],))
+                ws.audit(actor, 'member_enable' if enabled else 'member_disable', 'ok')
             ws.sessions = {k: v for k, v in ws.sessions.items() if v[0]["id"] != target["id"]}
             ws.audit(actor, "revoke_sessions", "ok")
             return web.json_response({"ok": True})
         return web.json_response({"members": [dict(id=i["id"],role=i["role"],regulated_content=i.get("regulated_content") is True,
+            enabled=not ws.disabled(i), can_manage=i['id']!=actor['id'] and (not i.get('regulated_content') or actor.get('regulated_content') is True),
             sessions=sum(v[0]["id"] == i["id"] and v[1] > time.time() for v in ws.sessions.values()))
             for i in ws.identities.values() if i["tenant"] == actor["tenant"]]})
+
+    async def trends(request):
+        actor = require(request, {'operator','manager','observer'})
+        rows=ws.db.execute("""SELECT date(i.at,'unixepoch') AS day,count(*) AS meetings,
+          round(sum(json_extract(m.aggregate,'$.duration_seconds'))/60.0,1) AS minutes,
+          sum(json_extract(m.aggregate,'$.interventions')) AS interventions
+          FROM meetings m JOIN meeting_imports i ON i.meeting=m.id
+          WHERE m.tenant=? AND m.expires>? AND i.at>? GROUP BY day ORDER BY day""",
+          (actor['tenant'],time.time(),time.time()-30*86400))
+        return web.json_response({'days':[dict(r) for r in rows], 'basis':'import_time_utc',
+          'unknown_import_dates':ws.db.execute('SELECT count(*) FROM meetings m LEFT JOIN meeting_imports i ON i.meeting=m.id WHERE m.tenant=? AND m.expires>? AND i.meeting IS NULL', (actor['tenant'],time.time())).fetchone()[0]})
+
+    async def incidents(request):
+        actor=require(request, {'operator','support'})
+        if request.method=='POST':
+            body=await object_body(request)
+            now=time.time()
+            if 'iid' in request.match_info:
+                row=ws.db.execute('SELECT * FROM incidents WHERE id=? AND tenant=?',(request.match_info['iid'],actor['tenant'])).fetchone()
+                if row is None:
+                    raise web.HTTPNotFound()
+                target=body.get('status')
+                expected={'open':'acknowledged','acknowledged':'resolved'}.get(row['status'])
+                if target != expected or expected is None:
+                    raise ValueError('Invalid incident transition')
+                with ws.db:
+                    ws.db.execute('UPDATE incidents SET status=?,updated=? WHERE id=?',(target,now,row['id']))
+                ws.audit(actor,'incident_'+target,'ok')
+            else:
+                if body.get('component') not in COMPONENTS or body.get('severity') not in {'warning','critical'}:
+                    raise ValueError('Invalid incident')
+                # No free text: support must never receive raw customer content.
+                with ws.db:
+                    if ws.db.execute("SELECT 1 FROM incidents WHERE tenant=? AND component=? AND status!='resolved'",(actor['tenant'],body['component'])).fetchone():
+                        raise web.HTTPConflict(reason='Component already has an open incident')
+                    ws.db.execute('INSERT INTO incidents VALUES (?,?,?,?,?,?,?)', (secrets.token_hex(16),actor['tenant'],body['component'],body['severity'],'open',now,now))
+                ws.audit(actor,'incident_create','ok')
+        limit,offset=paging(request)
+        rows=ws.db.execute('SELECT id,component,severity,status,created,updated FROM incidents WHERE tenant=? ORDER BY updated DESC,id LIMIT ? OFFSET ?', (actor['tenant'],limit,offset))
+        return web.json_response({'entries':[dict(r) for r in rows], 'limit':limit,'offset':offset,
+          'total_count':ws.db.execute('SELECT count(*) FROM incidents WHERE tenant=?',(actor['tenant'],)).fetchone()[0]})
 
     async def purge(request):
         actor = require(request, {"operator"})
@@ -398,6 +463,8 @@ def create_app(ws: Workspace, origin: str):
         web.post('/api/meetings/{mid}/grants', grants), web.delete('/api/meetings/{mid}', purge),
         web.post('/api/meetings/{mid}/policy', policy), web.get('/api/members', members), web.post('/api/members/revoke-sessions', members),
         web.get('/api/health/history', history),
+        web.post('/api/members/status', members), web.get('/api/trends',trends),
+        web.get('/api/incidents',incidents), web.post('/api/incidents',incidents), web.post('/api/incidents/{iid}',incidents),
         web.get('/api/health', health), web.post('/api/health', health), web.get('/api/audit', audit)])
     async def index(request):
         return web.FileResponse(Path(__file__).parent/'enterprise_ui'/'index.html')

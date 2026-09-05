@@ -1,12 +1,14 @@
 const $ = s => document.querySelector(s);
 const roles = {manager:'管理版',operator:'企業版',viewer:'會議閱覽',observer:'受限觀察者',support:'SaaS 服務後台'};
-const labels = {analytics:'會議分析',meetings:'內容與授權',health:'服務狀態',audit:'存取稽核',members:'成員工作階段',account:'我的工作階段'};
+const labels = {analytics:'會議分析',trends:'每日匯入統計',incidents:'事故處理',meetings:'內容與授權',health:'服務狀態',audit:'存取稽核',members:'成員工作階段',account:'我的工作階段'};
 const descriptions = {
  analytics:'比較會議時長與主席介入，這裡不載入姓名或逐字稿。',
  meetings:'逐場授權。受限會議須由管理員配置內容許可。',
  health:'只呈現服務代碼與最近回報狀態，不包含客戶會議內容。',
  audit:'追蹤存取與授權結果；紀錄不含逐字稿。',
- members:'終止登入中的工作階段；不會停用成員憑證。',
+ members:'管理成員啟用狀態，或只終止登入中的工作階段。',
+ trends:'依 UTC 匯入日期統計最近 30 天仍在保存期內的會議，不是會議發生日期。',
+ incidents:'手動登錄服務事故、確認及結案；尚未串接自動監控或外部通知。',
  account:'查看目前身分與到期時間，或登出此帳號的所有工作階段。'
 };
 let identity, current = 'analytics', revision = 0;
@@ -76,7 +78,7 @@ async function start() {
  document.body.classList.add('authenticated'); $('#sidebar').hidden = false; $('#context').hidden = false;
  $('#context').textContent = identity.tenant + ' / ' + (identity.regulated_content ? '受限內容管理' : roles[identity.role]);
  $('#role-art').className = identity.regulated_content ? 'cleared' : identity.role;
- const tabs = [...(identity.role === 'operator' ? ['analytics','meetings','health','audit','members'] : identity.role === 'support' ? ['health'] : identity.role === 'viewer' ? ['meetings'] : ['analytics']),'account'];
+ const tabs = [...(identity.role === 'operator' ? ['analytics','trends','meetings','health','incidents','audit','members'] : identity.role === 'support' ? ['health','incidents'] : identity.role === 'viewer' ? ['meetings'] : ['analytics','trends']),'account'];
  current = tabs[0];
  $('#nav').replaceChildren(...tabs.map(t => {
   const b = button(labels[t],async () => { current=t; filters.offset=0; await render(); });
@@ -110,6 +112,7 @@ async function render() {
  try {
   let path=page==='meetings'?'analytics':page==='account'?'me':page;
   if(['analytics','meetings','audit'].includes(page))path+='?'+new URLSearchParams({limit:20,offset:filters.offset,...(page==='audit'?{outcome:filters.outcome}:{q:filters.q,policy:filters.policy})});
+  if(page==='incidents')path+='?'+new URLSearchParams({limit:20,offset:filters.offset});
   const data = await api(path);
   if(page==='health')data.history=await api('health/history');
   if (epoch !== revision || !identity) return;
@@ -118,6 +121,8 @@ async function render() {
   else if (page === 'audit') renderAudit(fragment,data);
   else if (page === 'members') renderMembers(fragment,data);
   else if (page === 'account') renderAccount(fragment,data);
+  else if (page === 'incidents') renderIncidents(fragment,data);
+  else if (page === 'trends') renderTrends(fragment,data);
   else renderMeetings(fragment,data,page);
   pane.replaceChildren(fragment);
  } catch(e) {
@@ -152,11 +157,34 @@ function paginate(pane,data){
  bar.append(prev,el('span',`共 ${data.total_count} 筆 · 第 ${Math.floor(data.offset/data.limit)+1} 頁`),next);pane.append(bar);
 }
 function renderMembers(pane,data){
- pane.append(el('p','憑證配置仍由本機管理員維護。終止工作階段後，持有有效憑證的成員仍可重新登入。','small'));
- pane.append(table(['成員','角色','受限內容許可','登入中','操作'],data.members.map(a=>[a.id,roles[a.role],a.regulated_content?'有':'無',a.sessions,button('終止工作階段',async()=>{
+ pane.append(el('p','停用會阻擋後續登入並撤銷現有工作階段；恢復後原憑證可再次登入。不可停用自己。單純終止工作階段不會停用憑證。','small'));
+ pane.append(table(['成員','角色','受限內容許可','登入中','操作'],data.members.map(a=>{
+ const actions=el('div',undefined,'actions');actions.append(el('span',a.enabled?'已啟用':'已停用'));
+ if(a.can_manage)actions.append(button(a.enabled?'停用成員':'恢復成員',async()=>{
+  if(confirm(a.enabled?'停用此成員並撤銷登入？':'恢復此成員，原憑證將可重新登入？')){await api('members/status',{actor:a.id,enabled:!a.enabled});await render();}
+ },a.enabled?'danger':'secondary'));
+ actions.append(button('終止工作階段',async()=>{
   if(!confirm('終止此成員的所有登入工作階段？不會停用憑證。'))return;
   await api('members/revoke-sessions',{actor:a.id});await render();
- },'danger')])));
+ },'danger'));return [a.id,roles[a.role],a.regulated_content?'有':'無',a.sessions,actions];})));
+}
+function renderTrends(pane,data){
+ pane.append(el('p',`有 ${data.unknown_import_dates} 場舊資料缺少匯入時間，未納入下表；刪除或到期後也不再計入。此表不是效率評分。`,'small'));
+ pane.append(table(['匯入日期 UTC','會議數','累計分鐘','主席介入'],data.days.map(x=>[x.day,x.meetings,x.minutes,x.interventions])));
+ if(!data.days.length)pane.append(el('p','尚無具匯入日期的資料，請先匯入合成事件檔。','empty'));
+}
+function renderIncidents(pane,data){
+ const component=select([['chair','主席判斷'],['discord','Discord'],['stt','即時轉錄'],['tts','主席語音']]),severity=select([['warning','警告'],['critical','嚴重']]);
+ const form=el('div',undefined,'import');form.append(field('事故服務',component),field('嚴重程度',severity),button('登錄事故',async()=>{
+  try{await api('incidents',{component:component.value,severity:severity.value});await render();}
+  catch(e){throw Error('無法登錄：請檢查是否已有該服務未結案事故，或重新登入後再試。');}
+ }));pane.append(form);
+ const states={open:'待確認',acknowledged:'處理中',resolved:'已結案'};
+ pane.append(table(['服務','程度','狀態','最後更新','操作'],data.entries.map(x=>[x.component,x.severity==='critical'?'嚴重':'警告',states[x.status],new Date(x.updated*1000).toLocaleString(),x.status==='resolved'?'—':button(x.status==='open'?'確認事故':'結案',async()=>{
+  if(confirm('更新此事故狀態？結案不會把服務健康狀態改為正常。')){await api('incidents/'+x.id,{status:x.status==='open'?'acknowledged':'resolved'});await render();}
+ })])));
+ pane.append(el('p','已結案紀錄保存 90 天；事故內容僅包含固定服務代碼和狀態。','small'));
+ paginate(pane,data);
 }
 function renderAccount(pane,data){
  pane.append(table(['項目','內容'],[['組織',data.tenant],['角色',roles[data.role]],['到期時間',new Date(data.expires_at*1000).toLocaleString()]]));
