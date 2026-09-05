@@ -10,6 +10,7 @@ import os
 import secrets
 import sqlite3
 import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp import web
@@ -95,6 +96,7 @@ class Workspace:
         CREATE TABLE IF NOT EXISTS notification_reads (notification TEXT, actor TEXT, PRIMARY KEY(notification,actor));
         CREATE INDEX IF NOT EXISTS notifications_tenant_time ON notifications(tenant,at);
         CREATE TABLE IF NOT EXISTS meeting_imports (meeting TEXT PRIMARY KEY, at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS meeting_dates (meeting TEXT PRIMARY KEY, day TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS incidents (id TEXT PRIMARY KEY, tenant TEXT NOT NULL,
           component TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS incidents_tenant_updated ON incidents(tenant,updated);
@@ -156,6 +158,7 @@ class Workspace:
             self.db.execute("DELETE FROM audit WHERE at<?", (time.time()-90*86400,))
             self.db.execute("DELETE FROM health_history WHERE at<?", (time.time()-30*86400,))
             self.db.execute("DELETE FROM meeting_imports WHERE meeting NOT IN (SELECT id FROM meetings)")
+            self.db.execute("DELETE FROM meeting_dates WHERE meeting NOT IN (SELECT id FROM meetings)")
             self.db.execute("DELETE FROM incidents WHERE status='resolved' AND updated<?", (time.time()-90*86400,))
             self.db.execute('DELETE FROM notifications WHERE at<?',(time.time()-30*86400,))
             self.db.execute('DELETE FROM notification_reads WHERE notification NOT IN (SELECT id FROM notifications)')
@@ -504,6 +507,34 @@ def create_app(ws: Workspace, origin: str, *, demo_mode: bool = False):
         return web.json_response({'days':[dict(r) for r in rows], 'basis':'import_time_utc',
           'unknown_import_dates':ws.db.execute('SELECT count(*) FROM meetings m LEFT JOIN meeting_imports i ON i.meeting=m.id WHERE m.tenant=? AND m.expires>? AND i.meeting IS NULL', (actor['tenant'],time.time())).fetchone()[0]})
 
+    async def meeting_date(request):
+        actor=require(request, {'operator'})
+        body=await object_body(request)
+        row=meeting(request)
+        if row['policy']=='regulated' and not actor.get('regulated_content'):
+            raise web.HTTPForbidden()
+        day=body.get('day')
+        if not isinstance(day,str) or date.fromisoformat(day).isoformat()!=day or date.fromisoformat(day)>datetime.now(timezone.utc).date():
+            raise ValueError('Expected a non-future YYYY-MM-DD meeting date')
+        with ws.db:
+            ws.db.execute('INSERT OR REPLACE INTO meeting_dates VALUES (?,?)',(row['id'],day))
+        ws.audit(actor,'meeting_date_update','ok')
+        return web.json_response({'day':day,'source':'operator_entered'})
+
+    async def meeting_trends(request):
+        actor=require(request, {'operator','manager','observer'})
+        days=int(request.query.get('days','30'))
+        if days not in {30,90,365}:
+            raise ValueError('Unsupported date window')
+        cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days-1)).isoformat()
+        rows=ws.db.execute("""SELECT d.day,count(*) AS meetings,
+          round(avg(json_extract(m.aggregate,'$.duration_seconds'))/60.0,2) AS average_minutes,
+          sum(json_extract(m.aggregate,'$.interventions')) AS interventions,
+          round(600.0*sum(json_extract(m.aggregate,'$.interventions'))/nullif(sum(json_extract(m.aggregate,'$.duration_seconds')),0),2) AS interventions_per_10_minutes
+          FROM meetings m JOIN meeting_dates d ON d.meeting=m.id WHERE m.tenant=? AND m.expires>? AND d.day>=? GROUP BY d.day ORDER BY d.day""",(actor['tenant'],time.time(),cutoff))
+        missing=ws.db.execute('SELECT count(*) FROM meetings m LEFT JOIN meeting_dates d ON d.meeting=m.id WHERE m.tenant=? AND m.expires>? AND d.meeting IS NULL',(actor['tenant'],time.time())).fetchone()[0]
+        return web.json_response({'days':[dict(r) for r in rows],'window_days':days,'missing_dates':missing,'source':'operator_entered','retained_only':True})
+
     async def incidents(request):
         actor=require(request, {'operator','support'})
         if request.method=='POST':
@@ -585,6 +616,7 @@ def create_app(ws: Workspace, origin: str, *, demo_mode: bool = False):
         web.post('/api/members/status', members), web.get('/api/trends',trends),
         web.post('/api/members/create',credentials), web.post('/api/members/rotate',credentials),
         web.get('/api/alert-rules',alert_rules), web.post('/api/alert-rules',alert_rules),
+        web.post('/api/meetings/{mid}/date',meeting_date), web.get('/api/meeting-trends',meeting_trends),
         web.get('/api/notifications',notifications), web.post('/api/notifications/{nid}/read',notifications),
         web.get('/api/incidents',incidents), web.post('/api/incidents',incidents), web.post('/api/incidents/{iid}',incidents),
         web.get('/api/health', health), web.post('/api/health', health), web.get('/api/audit', audit)])

@@ -1,6 +1,7 @@
 const $ = s => document.querySelector(s);
 const roles = {manager:'管理版',operator:'企業版',viewer:'會議閱覽',observer:'受限觀察者',support:'SaaS 服務後台'};
 const labels = {analytics:'會議分析',trends:'每日匯入統計',incidents:'事故處理',notifications:'站內通知','alert-rules':'通知規則',meetings:'內容與授權',health:'服務狀態',audit:'存取稽核',members:'成員工作階段',account:'我的工作階段'};
+labels['meeting-trends']='會議日期分析';
 const descriptions = {
  analytics:'比較會議時長與主席介入，這裡不載入姓名或逐字稿。',
  meetings:'逐場授權。受限會議須由管理員配置內容許可。',
@@ -14,6 +15,8 @@ const descriptions = {
  account:'查看目前身分與到期時間，或登出此帳號的所有工作階段。'
 };
 let identity, current = 'analytics', revision = 0;
+let trendDays=30;
+descriptions['meeting-trends']='依管理員填寫的會議日期分析目前仍保存的資料；不是匯入日期，也不是會議效率評分。';
 let expiryTimer, accessTimer;
 const filters = {q:'',policy:'all',outcome:'all',offset:0};
 const el = (tag, text, cls) => {
@@ -82,6 +85,7 @@ async function start() {
  if(identity.demo_mode)$('#context').textContent+=' / 合成資料演練';
  $('#role-art').className = identity.regulated_content ? 'cleared' : identity.role;
  const tabs = [...(identity.role === 'operator' ? ['analytics','trends','meetings','health','incidents','notifications','alert-rules','audit','members'] : identity.role === 'support' ? ['health','incidents','notifications'] : identity.role === 'viewer' ? ['meetings'] : ['analytics','trends']),'account'];
+ if(['operator','manager','observer'].includes(identity.role))tabs.splice(2,0,'meeting-trends');
  current = tabs[0];
  $('#nav').replaceChildren(...tabs.map(t => {
   const b = button(labels[t],async () => { current=t; filters.offset=0; await render(); });
@@ -117,6 +121,7 @@ async function render() {
   if(['analytics','meetings','audit'].includes(page))path+='?'+new URLSearchParams({limit:20,offset:filters.offset,...(page==='audit'?{outcome:filters.outcome}:{q:filters.q,policy:filters.policy})});
   if(page==='incidents')path+='?'+new URLSearchParams({limit:20,offset:filters.offset});
   if(page==='notifications')path+='?'+new URLSearchParams({limit:20,offset:filters.offset});
+  if(page==='meeting-trends')path+='?days='+trendDays;
   const data = await api(path);
   if(page==='health')data.history=await api('health/history');
   if (epoch !== revision || !identity) return;
@@ -127,6 +132,7 @@ async function render() {
   else if (page === 'account') renderAccount(fragment,data);
   else if (page === 'incidents') renderIncidents(fragment,data);
   else if (page === 'trends') renderTrends(fragment,data);
+  else if (page === 'meeting-trends') renderMeetingTrends(fragment,data);
   else if (page === 'notifications') renderNotifications(fragment,data);
   else if (page === 'alert-rules') renderAlertRules(fragment,data);
   else renderMeetings(fragment,data,page);
@@ -212,6 +218,20 @@ function renderTrends(pane,data){
  pane.append(table(['匯入日期 UTC','會議數','累計分鐘','主席介入'],data.days.map(x=>[x.day,x.meetings,x.minutes,x.interventions])));
  if(!data.days.length)pane.append(el('p','尚無具匯入日期的資料，請先匯入合成事件檔。','empty'));
 }
+function renderMeetingTrends(pane,data){
+ const window=select([['30','最近 30 天'],['90','最近 90 天'],['365','最近 365 天']]);window.value=String(trendDays);
+ window.onchange=()=>{trendDays=Number(window.value);render().catch(error);};pane.append(field('分析期間',window));
+ pane.append(el('p',`資料來源：管理員填寫。有 ${data.missing_dates} 場未填日期，不猜測補值。到期或刪除後不再計入；每 10 分鐘介入次數只是頻率，不代表品質。`,'small'));
+ pane.append(table(['會議日期','會議數','平均分鐘','主席介入','每 10 分鐘介入'],data.days.map(x=>[x.day,x.meetings,x.average_minutes,x.interventions,x.interventions_per_10_minutes??'無法計算'])));
+ if(!data.days.length)pane.append(el('p','此期間尚無具會議日期的資料，管理員可在「內容與授權」填寫日期。','empty'));
+}
+function meetingDate(m){
+ const pane=detailPane('填寫會議日期'),form=el('form',undefined,'import'),input=el('input');input.type='date';input.required=true;input.max=new Date().toISOString().slice(0,10);
+ const submit=el('button','儲存會議日期');submit.type='submit';form.append(field('會議日期',input),submit);pane.append(el('p','請填寫實際會議日期；系統記錄為管理員提供，不會自行推測。','small'),form);
+ form.onsubmit=async e=>{e.preventDefault();if(submit.disabled)return;submit.disabled=true;const epoch=revision;
+  try{await api('meetings/'+m.id+'/date',{day:input.value});if(epoch===revision)await render();}catch(e){if(epoch===revision)error(e);}finally{submit.disabled=false;}
+ };
+}
 function renderAlertRules(pane,data){
  pane.append(el('p','啟用後會立即檢查已有回報；異常或超過 5 分鐘未更新會產生通知。相同狀態不重複通知；無任何回報時不會推測故障。恢復正常僅通知，事故由人員確認結案。','small'));
  for(const r of data.rules){
@@ -293,6 +313,7 @@ function renderMeetings(pane,data,page) {
     actions.append(button('查看內容',()=>detail(m)));
     if(identity.role==='operator')actions.append(button('管理授權',()=>grants(m),'secondary'));
     if(identity.role==='operator')actions.append(button('保存政策',()=>retention(m),'secondary'));
+    if(identity.role==='operator')actions.append(button('填寫日期',()=>meetingDate(m),'secondary'));
    } else actions.append(el('span','需受限內容許可','small'));
    if(identity.role==='operator')actions.append(button('刪除',async()=>{
     if(confirm('永久刪除此場會議的儲存內容與授權？')){

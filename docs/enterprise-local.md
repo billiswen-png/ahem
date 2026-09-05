@@ -1,5 +1,7 @@
 # 第 2～5 層：本機企業工作台
 
+本機 demo 最新收尾：[會議日期分析與備份保留管理](evidence/local-demo-final/README.md)。包含最新測試、運行截圖及「已實作但未啟用週期清理」等界線；歷史待辦請以此報告為準。
+
 最新範圍已收斂為「不接外部服務，只完成本機 demo」。站內通知、自動事故與合成回報演練已加入，請見 [本機 demo 驗收與截圖](evidence/local-demo-alerts/README.md)。歷史章節的外部整合待辦不代表本次仍要求交付那些商用功能。
 
 最新功能：已加入新增限時成員與憑證輪替 UI／持久化，請以 [本次憑證交付報告](evidence/enterprise-credentials/README.md) 的完成清單與限制為準。

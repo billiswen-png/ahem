@@ -1,0 +1,1 @@
+PASS: enter date -> save -> date-based metrics -> 365-day filter; desktop/mobile, zero console/page errors; EXIT_CODE=0
