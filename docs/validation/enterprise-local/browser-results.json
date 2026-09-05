@@ -1,0 +1,27 @@
+{
+  "manager": {
+    "page_errors": 0,
+    "screenshot": "manager.png",
+    "status": "pass"
+  },
+  "operator": {
+    "page_errors": 0,
+    "screenshot": "operator.png",
+    "status": "pass"
+  },
+  "observer": {
+    "page_errors": 0,
+    "screenshot": "observer.png",
+    "status": "pass"
+  },
+  "support": {
+    "page_errors": 0,
+    "screenshot": "support.png",
+    "status": "pass"
+  },
+  "content-officer": {
+    "page_errors": 0,
+    "screenshot": "content-officer.png",
+    "status": "pass"
+  }
+}
