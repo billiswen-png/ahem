@@ -1,5 +1,57 @@
 # 第 2～5 層：本機企業工作台
 
+## 2026-09-05 流程補齊
+
+此版本是本機功能版，不是已通過金融、醫療或法律合規認證的產品。
+
+| 層 | 本次可操作流程 | 尚未完成的正式產品能力 |
+|---|---|---|
+| 2 | 會議代碼／政策篩選、分頁、全篩選範圍統計、本頁 JSON 匯出 | 長期趨勢、統計匿名性評估與跨組織授權 |
+| 3 | 成員登入數、終止工作階段、個人全部登出、分頁稽核與結果篩選 | 成員邀請／停用、SSO、MFA、憑證輪替 UI |
+| 4 | 縮短保存期限、受限政策升級、禁止降級、內容讀取後定期重新檢查權限 | 法遵評估、legal hold、KMS 輪替、備份與災難復原演練 |
+| 5 | 安全狀態歷程（最近 100 筆／30 天），現況過期顯示未知 | 真實監測 adapter、通知投遞、值班與事故處理整合 |
+
+工作階段撤銷不等於停用憑證；有效憑證可以重新登入。成員配置仍由私有身分檔管理。
+內容視窗每 15 秒檢查一次 access API，失去權限則清空；網路與背景分頁節流會影響偵測時間，
+無法撤回已下載或截圖的內容。伺服器每次讀取內容仍即時檢查權限，不依賴輪詢。
+接收 JSON body 後再次驗證 session，並在 body 收完後才讀取會議 grant／policy，避免等待期間的撤權失效。
+
+新增 API：`GET /api/members`、`POST /api/members/revoke-sessions`、`POST /api/logout-all`、
+`POST /api/meetings/{id}/policy`、`GET /api/meetings/{id}/access`、`GET /api/health/history`。
+analytics 支援 limit（1–100）、offset、q（十六進位代碼前綴）、policy；audit 支援 limit、offset、outcome。
+統計 total_count／total_minutes／total_interventions 針對全部篩選結果，meetings 僅為當頁。
+
+效能範圍：列表有 SQL 分頁及索引、健康歷程上限；仍使用單程序同步 SQLite，
+沒有宣稱已完成高併發優化、降低音訊延遲或 Raspberry Pi 實測。
+資料庫啟動時新增索引與 health_history 表，不修改既有會議內容；部署前停止程序並備份 DB 與 KEK。
+回復到前版本可讀取原有表；會遺失本次新 API／UI 能力，重啟後 session 均需重新登入。
+
+### 本次驗證證據
+
+macOS、Python 3.13.5、Playwright 使用本機 Google Chrome。
+
+```bash
+../ahem/.venv/bin/python -m pytest -q tests/test_enterprise.py tests/test_enterprise_workflows.py
+# 44 passed, exit 0
+PYTHONPATH=src:../outputs/enterprise-ui-20260905 ../ahem/.venv/bin/python -m pytest -p browser_channel -q -rs tests
+# 654 passed, 21 skipped, 2 xfailed, 0 failed, exit 0 (28.16s)
+../ahem/.venv/bin/python scripts/verify_enterprise_browser.py \
+  --identities /tmp/ahem-complete-check-20260905/identities.json \
+  --output ../outputs/enterprise-complete-20260905/screenshots \
+  --url http://127.0.0.1:8892 --channel chrome
+# 6 roles pass, zero page/console errors, exit 0
+```
+
+browser_channel 是 repo 外測試 adapter，只指定已安裝的 Chrome，未跳過安全檢查。
+21 skips：17 私有 holdout 資料缺少、4 真實 Discord opt-in；2 xfail 為既有測試。
+瀏覽器涵蓋登入／登出、匯入、授權／撤銷、內容、統計匯出、篩選、保存政策、
+成員工作階段撤銷、稽核／健康／個人頁與 390px 手機無水平溢出。
+第一輪腳本因未等待授權面板載入而逾時，補明確等待後完整重跑通過。
+log 與真實執行截圖在 repo 外 `../outputs/enterprise-complete-20260905/`。
+單元測試流程證據：`tests/test_enterprise_workflows.py`；瀏覽器操作證據：`scripts/verify_enterprise_browser.py`。
+未驗證：正式憑證服務、Linux/aarch64 實機、高併發、災難復原、真實 Discord／語音 provider 端到端。
+本次不推送、不更新 PR、不更改原始 demo。
+
 ## 後台 UI 整合
 
 目前 UI 已更新為 v2：白底／冷灰側欄／靛紫操作、固定側邊導覽與手機頂部導覽。

@@ -47,6 +47,9 @@ def main():
                     page.get_by_role('button',name='匯入事件檔').click()
                     expect(page.locator('tbody tr')).to_have_count(count+1)
                     page.get_by_role('button',name='管理授權').first.click()
+                    expect(page.locator('.detail')).to_contain_text('會議閱覽授權')
+                    if page.get_by_role('button',name='允許閱覽').count():
+                        page.get_by_role('button',name='允許閱覽').click()
                     page.get_by_role('button',name='撤銷閱覽').click()
                     page.get_by_role('button',name='允許閱覽').wait_for()
                     page.get_by_role('button',name='允許閱覽').click()
@@ -71,6 +74,31 @@ def main():
                 page.get_by_role('button',name='查看內容').first.click()
                 page.get_by_role('button',name='確認讀取').click()
                 expect(page.locator('.transcript')).to_contain_text('先回到第二季上線排程')
+            if role=='manager':
+                with page.expect_download() as download:
+                    page.get_by_role('button',name='匯出本頁統計 JSON').click()
+                exported=json.loads(Path(download.value.path()).read_text())
+                assert exported['scope']=='current_page' and '林同' not in str(exported)
+                page.get_by_label('篩選政策').select_option('regulated')
+                page.get_by_role('button',name='套用篩選').click()
+                expect(page.locator('tbody tr')).to_have_count(1)
+            if role=='operator':
+                page.on('dialog',lambda dialog:dialog.accept())
+                page.get_by_role('button',name='保存政策',exact=True).first.click()
+                page.get_by_label('新的最長保存天數').fill('1')
+                page.get_by_role('button',name='確認更新政策').click()
+                expect(page.locator('.detail')).to_have_count(0)
+                for tab,title in [('成員工作階段','members'),('存取稽核','audit'),('服務狀態','health'),('我的工作階段','account')]:
+                    page.get_by_role('button',name=tab,exact=True).click()
+                    expect(page.locator('#panel')).to_have_attribute('aria-busy','false')
+                    if title=='members':
+                        expect(page.locator('tbody tr')).to_have_count(6)
+                        row=page.locator('tbody tr').filter(has=page.get_by_text('viewer',exact=True))
+                        row.get_by_role('button',name='終止工作階段').click()
+                        expect(page.locator('#panel')).to_have_attribute('aria-busy','false')
+                    page.screenshot(path=str(args.output/f'{title}.png'),full_page=True)
+                page.get_by_role('button',name='內容與授權',exact=True).click()
+                expect(page.locator('#panel')).to_have_attribute('aria-busy','false')
             assert errors==[],errors
             assert console==[],console
             page.evaluate('window.scrollTo(0,0)')
