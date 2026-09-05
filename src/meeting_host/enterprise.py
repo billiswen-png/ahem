@@ -85,6 +85,8 @@ class Workspace:
         self.attempts = {}
 
     def identify(self, token):
+        if not isinstance(token, str) or len(token) > 4096:
+            raise ValueError("Invalid token")
         digest = hashlib.sha256(token.encode()).hexdigest()
         for expected, identity in self.identities.items():
             if hmac.compare_digest(expected, digest):

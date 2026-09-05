@@ -9,20 +9,33 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--identities',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--url', default='http://127.0.0.1:8890')
+    parser.add_argument('--channel', default=None, help='Optional installed browser channel, e.g. chrome')
     args=parser.parse_args()
     ids={i['id']:i for i in json.loads(args.identities.read_text())}
     args.output.mkdir(parents=True,exist_ok=True)
     results={}
     with sync_playwright() as p:
-        browser=p.chromium.launch()
-        for role in ['manager','operator','observer','support','content-officer']:
+        browser=p.chromium.launch(channel=args.channel)
+        for role in ['manager','operator','observer','support','content-officer','viewer']:
             context=browser.new_context(viewport={'width':1440,'height':1000})
-            page=context.new_page();errors=[]
+            page=context.new_page();errors=[];console=[]
             page.on('pageerror',lambda e:errors.append(str(e)))
-            page.goto('http://127.0.0.1:8890/')
+            page.on('console',lambda m:console.append(m.text) if m.type=='error' and '401' not in m.text else None)
+            page.goto(args.url+'/')
+            assert page.title()=='Ahem 企業工作台'
+            if role=='manager':
+                page.screenshot(path=str(args.output/'login.png'),full_page=True)
+                page.set_viewport_size({'width':390,'height':844})
+                page.screenshot(path=str(args.output/'login-mobile.png'),full_page=True)
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                page.set_viewport_size({'width':1440,'height':1000})
+            for asset in ['login-background.png','roles-and-states.png']:
+                assert page.request.get(args.url+'/ui/assets/'+asset).status==200
             page.get_by_label('存取憑證').fill(ids[role]['token'])
             page.get_by_role('button',name='進入工作台').click()
             page.locator('#workspace').wait_for(state='visible')
+            expect(page.locator('#panel')).to_have_attribute('aria-busy','false')
             if role in {'operator','content-officer'}:
                 page.get_by_role('button',name='內容與授權',exact=True).click()
                 page.get_by_role('button',name='查看內容').first.wait_for()
@@ -52,9 +65,16 @@ def main():
             if role=='support':
                 page.get_by_text('尚無有效回報').first.wait_for()
                 assert page.get_by_role('button',name='內容與授權',exact=True).count()==0
+            if role=='viewer':
+                assert page.get_by_role('button',name='匯入事件檔',exact=True).count()==0
+                assert page.get_by_role('button',name='管理授權',exact=True).count()==0
+                page.get_by_role('button',name='查看內容').first.click()
+                page.get_by_role('button',name='確認讀取').click()
+                expect(page.locator('.transcript')).to_contain_text('先回到第二季上線排程')
             assert errors==[],errors
+            assert console==[],console
             page.screenshot(path=str(args.output/f'{role}.png'),full_page=True)
-            results[role]={'page_errors':len(errors),'screenshot':f'{role}.png','status':'pass'}
+            results[role]={'page_errors':len(errors),'console_errors':len(console),'screenshot':f'{role}.png','status':'pass'}
             if role=='manager':
                 page.set_viewport_size({'width':390,'height':844})
                 page.screenshot(path=str(args.output/'manager-mobile.png'),full_page=True)

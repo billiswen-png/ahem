@@ -22,6 +22,15 @@ def test_actual_ahem_event_contract():
     assert result['participants'] == 3
 
 
+@pytest.mark.parametrize('token', [None, 42, [], {}, 'x' * 4097])
+def test_malformed_login_token_returns_400(tmp_path, token):
+    async def run():
+        async with TestClient(TestServer(create_app(setup(tmp_path), ORIGIN))) as c:
+            response = await c.post('/api/login', json={'token': token}, headers={'Origin': ORIGIN})
+            assert response.status == 400
+    asyncio.run(run())
+
+
 def identities():
     return [dict(id=r, tenant='org-a', role=r, token=(r+'-')*32) for r in
             ['operator', 'viewer', 'manager', 'observer', 'support']] + [
