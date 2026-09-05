@@ -89,6 +89,11 @@ class Workspace:
         CREATE TABLE IF NOT EXISTS health_history (tenant TEXT, component TEXT, state TEXT, at REAL);
         CREATE TABLE IF NOT EXISTS disabled_members (actor TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS member_credentials (actor TEXT PRIMARY KEY, digest TEXT UNIQUE NOT NULL, profile TEXT NOT NULL, expires REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS alert_rules (tenant TEXT, component TEXT, enabled INTEGER NOT NULL, PRIMARY KEY(tenant,component));
+        CREATE TABLE IF NOT EXISTS alert_state (tenant TEXT, component TEXT, state TEXT, PRIMARY KEY(tenant,component));
+        CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, tenant TEXT, component TEXT, kind TEXT, at REAL);
+        CREATE TABLE IF NOT EXISTS notification_reads (notification TEXT, actor TEXT, PRIMARY KEY(notification,actor));
+        CREATE INDEX IF NOT EXISTS notifications_tenant_time ON notifications(tenant,at);
         CREATE TABLE IF NOT EXISTS meeting_imports (meeting TEXT PRIMARY KEY, at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS incidents (id TEXT PRIMARY KEY, tenant TEXT NOT NULL,
           component TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
@@ -144,6 +149,7 @@ class Workspace:
         self.db.commit()
 
     def expire(self):
+        self.evaluate_alerts()
         with self.db:
             self.db.execute("DELETE FROM grants WHERE meeting IN (SELECT id FROM meetings WHERE expires<=?)", (time.time(),))
             self.db.execute("DELETE FROM meetings WHERE expires<=?", (time.time(),))
@@ -151,6 +157,31 @@ class Workspace:
             self.db.execute("DELETE FROM health_history WHERE at<?", (time.time()-30*86400,))
             self.db.execute("DELETE FROM meeting_imports WHERE meeting NOT IN (SELECT id FROM meetings)")
             self.db.execute("DELETE FROM incidents WHERE status='resolved' AND updated<?", (time.time()-90*86400,))
+            self.db.execute('DELETE FROM notifications WHERE at<?',(time.time()-30*86400,))
+            self.db.execute('DELETE FROM notification_reads WHERE notification NOT IN (SELECT id FROM notifications)')
+
+    def evaluate_alerts(self):
+        """Allowlisted health only; never include raw errors or meeting content."""
+        now=time.time()
+        rows=self.db.execute('SELECT h.* FROM health h JOIN alert_rules r ON h.tenant=r.tenant AND h.component=r.component WHERE r.enabled=1').fetchall()
+        with self.db:
+            for row in rows:
+                state=row['state'] if now-row['at']<300 else 'unknown'
+                old=self.db.execute('SELECT state FROM alert_state WHERE tenant=? AND component=?',(row['tenant'],row['component'])).fetchone()
+                if old and old[0]==state:
+                    continue
+                self.db.execute('INSERT OR REPLACE INTO alert_state VALUES (?,?,?)',(row['tenant'],row['component'],state))
+                if state=='ok' and (old is None or old[0]=='ok'):
+                    continue
+                kind='recovered' if state=='ok' else state
+                self.db.execute('INSERT INTO notifications VALUES (?,?,?,?,?)',(secrets.token_hex(16),row['tenant'],row['component'],kind,now))
+                if state!='ok':
+                    incident=self.db.execute("SELECT id FROM incidents WHERE tenant=? AND component=? AND status!='resolved'",(row['tenant'],row['component'])).fetchone()
+                    severity='critical' if state=='unavailable' else 'warning'
+                    if not incident:
+                        self.db.execute('INSERT INTO incidents VALUES (?,?,?,?,?,?,?)',(secrets.token_hex(16),row['tenant'],row['component'],severity,'open',now,now))
+                    elif severity=='critical':
+                        self.db.execute('UPDATE incidents SET severity=?,updated=? WHERE id=?',(severity,now,incident[0]))
 
     def ingest(self, actor, events, policy, days):
         if actor["role"] != "operator":
@@ -170,7 +201,7 @@ class Workspace:
         return mid
 
 
-def create_app(ws: Workspace, origin: str):
+def create_app(ws: Workspace, origin: str, *, demo_mode: bool = False):
     if not (origin.startswith("https://") or origin.startswith("http://127.0.0.1:")):
         raise ValueError("Use HTTPS or loopback")
 
@@ -265,6 +296,7 @@ def create_app(ws: Workspace, origin: str):
     async def me(request):
         a = request[ACTOR]
         return web.json_response({"role": a["role"], "tenant": a["tenant"],
+                                  "demo_mode": demo_mode,
                                   "regulated_content": a.get("regulated_content") is True,
                                   "expires_at": ws.sessions[request.cookies["enterprise"]][1]})
 
@@ -358,6 +390,7 @@ def create_app(ws: Workspace, origin: str):
                 if not previous or previous[0] != body["state"]:
                     ws.db.execute("INSERT INTO health_history VALUES (?,?,?,?)", (actor["tenant"], body["component"], body["state"], time.time()))
                 ws.db.execute("INSERT OR REPLACE INTO health VALUES (?,?,?,?)", (actor["tenant"], body["component"], body["state"], time.time()))
+            ws.evaluate_alerts()
         rows = {r["component"]: r for r in ws.db.execute("SELECT * FROM health WHERE tenant=?", (actor["tenant"],))}
         return web.json_response({"components": [dict(component=c,
             state=rows[c]["state"] if c in rows and time.time()-rows[c]["at"] < 300 else "unknown",
@@ -501,6 +534,37 @@ def create_app(ws: Workspace, origin: str):
         return web.json_response({'entries':[dict(r) for r in rows], 'limit':limit,'offset':offset,
           'total_count':ws.db.execute('SELECT count(*) FROM incidents WHERE tenant=?',(actor['tenant'],)).fetchone()[0]})
 
+    async def alert_rules(request):
+        actor=require(request, {'operator'})
+        if request.method=='POST':
+            body=await object_body(request)
+            if body.get('component') not in COMPONENTS or type(body.get('enabled')) is not bool:
+                raise ValueError('Invalid alert rule')
+            with ws.db:
+                ws.db.execute('INSERT OR REPLACE INTO alert_rules VALUES (?,?,?)',(actor['tenant'],body['component'],int(body['enabled'])))
+                if not body['enabled']:
+                    ws.db.execute('DELETE FROM alert_state WHERE tenant=? AND component=?',(actor['tenant'],body['component']))
+            ws.audit(actor,'alert_rule_update','ok')
+            ws.evaluate_alerts()
+        rules={r['component']:bool(r['enabled']) for r in ws.db.execute('SELECT * FROM alert_rules WHERE tenant=?',(actor['tenant'],))}
+        return web.json_response({'rules':[{'component':c,'enabled':rules.get(c,False)} for c in sorted(COMPONENTS)]})
+
+    async def notifications(request):
+        actor=require(request, {'operator','support'})
+        if request.method=='POST':
+            await object_body(request)
+            row=ws.db.execute('SELECT id FROM notifications WHERE id=? AND tenant=?',(request.match_info['nid'],actor['tenant'])).fetchone()
+            if row is None:
+                raise web.HTTPNotFound()
+            with ws.db:
+                ws.db.execute('INSERT OR IGNORE INTO notification_reads VALUES (?,?)',(row[0],actor['id']))
+            return web.json_response({'ok':True})
+        limit,offset=paging(request)
+        cutoff=time.time()-30*86400
+        rows=ws.db.execute('SELECT n.id,n.component,n.kind,n.at,r.actor IS NOT NULL AS is_read FROM notifications n LEFT JOIN notification_reads r ON r.notification=n.id AND r.actor=? WHERE n.tenant=? AND n.at>? ORDER BY n.at DESC,n.id LIMIT ? OFFSET ?', (actor['id'],actor['tenant'],cutoff,limit,offset))
+        return web.json_response({'entries':[dict(r) for r in rows],'limit':limit,'offset':offset,
+            'total_count':ws.db.execute('SELECT count(*) FROM notifications WHERE tenant=? AND at>?',(actor['tenant'],cutoff)).fetchone()[0]})
+
     async def purge(request):
         actor = require(request, {"operator"})
         row = meeting(request)
@@ -520,6 +584,8 @@ def create_app(ws: Workspace, origin: str):
         web.get('/api/health/history', history),
         web.post('/api/members/status', members), web.get('/api/trends',trends),
         web.post('/api/members/create',credentials), web.post('/api/members/rotate',credentials),
+        web.get('/api/alert-rules',alert_rules), web.post('/api/alert-rules',alert_rules),
+        web.get('/api/notifications',notifications), web.post('/api/notifications/{nid}/read',notifications),
         web.get('/api/incidents',incidents), web.post('/api/incidents',incidents), web.post('/api/incidents/{iid}',incidents),
         web.get('/api/health', health), web.post('/api/health', health), web.get('/api/audit', audit)])
     async def index(request):
@@ -549,11 +615,12 @@ def main():
     parser.add_argument('--identities', type=Path, required=True)
     parser.add_argument('--database', type=Path, required=True)
     parser.add_argument('--port', type=int, default=8890)
+    parser.add_argument('--demo-mode',action='store_true',help='Show explicit synthetic health-report controls; authorization is unchanged')
     args = parser.parse_args()
     if args.identities.is_symlink() or args.identities.stat().st_mode & 0o077:
         raise ValueError('Identities file must be private (0600)')
     ws = Workspace(args.database, load_kek(), json.loads(args.identities.read_text()))
-    web.run_app(create_app(ws, f'http://127.0.0.1:{args.port}'), host='127.0.0.1', port=args.port,
+    web.run_app(create_app(ws, f'http://127.0.0.1:{args.port}',demo_mode=args.demo_mode), host='127.0.0.1', port=args.port,
                 access_log=None)
 
 

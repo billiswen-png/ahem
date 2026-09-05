@@ -1,6 +1,6 @@
 const $ = s => document.querySelector(s);
 const roles = {manager:'管理版',operator:'企業版',viewer:'會議閱覽',observer:'受限觀察者',support:'SaaS 服務後台'};
-const labels = {analytics:'會議分析',trends:'每日匯入統計',incidents:'事故處理',meetings:'內容與授權',health:'服務狀態',audit:'存取稽核',members:'成員工作階段',account:'我的工作階段'};
+const labels = {analytics:'會議分析',trends:'每日匯入統計',incidents:'事故處理',notifications:'站內通知','alert-rules':'通知規則',meetings:'內容與授權',health:'服務狀態',audit:'存取稽核',members:'成員工作階段',account:'我的工作階段'};
 const descriptions = {
  analytics:'比較會議時長與主席介入，這裡不載入姓名或逐字稿。',
  meetings:'逐場授權。受限會議須由管理員配置內容許可。',
@@ -8,7 +8,9 @@ const descriptions = {
  audit:'追蹤存取與授權結果；紀錄不含逐字稿。',
  members:'管理成員啟用狀態，或只終止登入中的工作階段。',
  trends:'依 UTC 匯入日期統計最近 30 天仍在保存期內的會議，不是會議發生日期。',
- incidents:'手動登錄服務事故、確認及結案；尚未串接自動監控或外部通知。',
+ incidents:'手動登錄或由已啟用規則建立事故；恢復通知不會自動結案。',
+ notifications:'只包含服務代碼與狀態；已讀不代表事故結案。此頁需重新整理，不發送外部通知。',
+ 'alert-rules':'依收到的狀態回報建立站內通知與事故。預設關閉，未接上真實服務的自動監測。',
  account:'查看目前身分與到期時間，或登出此帳號的所有工作階段。'
 };
 let identity, current = 'analytics', revision = 0;
@@ -77,8 +79,9 @@ async function start() {
  $('#login').hidden = true; $('#workspace').hidden = false; $('#logout').hidden = false;
  document.body.classList.add('authenticated'); $('#sidebar').hidden = false; $('#context').hidden = false;
  $('#context').textContent = identity.tenant + ' / ' + (identity.regulated_content ? '受限內容管理' : roles[identity.role]);
+ if(identity.demo_mode)$('#context').textContent+=' / 合成資料演練';
  $('#role-art').className = identity.regulated_content ? 'cleared' : identity.role;
- const tabs = [...(identity.role === 'operator' ? ['analytics','trends','meetings','health','incidents','audit','members'] : identity.role === 'support' ? ['health','incidents'] : identity.role === 'viewer' ? ['meetings'] : ['analytics','trends']),'account'];
+ const tabs = [...(identity.role === 'operator' ? ['analytics','trends','meetings','health','incidents','notifications','alert-rules','audit','members'] : identity.role === 'support' ? ['health','incidents','notifications'] : identity.role === 'viewer' ? ['meetings'] : ['analytics','trends']),'account'];
  current = tabs[0];
  $('#nav').replaceChildren(...tabs.map(t => {
   const b = button(labels[t],async () => { current=t; filters.offset=0; await render(); });
@@ -113,6 +116,7 @@ async function render() {
   let path=page==='meetings'?'analytics':page==='account'?'me':page;
   if(['analytics','meetings','audit'].includes(page))path+='?'+new URLSearchParams({limit:20,offset:filters.offset,...(page==='audit'?{outcome:filters.outcome}:{q:filters.q,policy:filters.policy})});
   if(page==='incidents')path+='?'+new URLSearchParams({limit:20,offset:filters.offset});
+  if(page==='notifications')path+='?'+new URLSearchParams({limit:20,offset:filters.offset});
   const data = await api(path);
   if(page==='health')data.history=await api('health/history');
   if (epoch !== revision || !identity) return;
@@ -123,6 +127,8 @@ async function render() {
   else if (page === 'account') renderAccount(fragment,data);
   else if (page === 'incidents') renderIncidents(fragment,data);
   else if (page === 'trends') renderTrends(fragment,data);
+  else if (page === 'notifications') renderNotifications(fragment,data);
+  else if (page === 'alert-rules') renderAlertRules(fragment,data);
   else renderMeetings(fragment,data,page);
   pane.replaceChildren(fragment);
  } catch(e) {
@@ -134,6 +140,15 @@ async function render() {
 function renderHealth(pane,data) {
  const names = {chair:'主席判斷',discord:'Discord 連線',stt:'即時轉錄',tts:'主席語音'};
  const states = {unknown:'尚無有效回報',ok:'正常',degraded:'效能下降',unavailable:'無法使用'};
+ if(identity.demo_mode){
+  pane.append(el('p','合成資料演練：這些狀態由示範操作產生，不代表真實 Discord／語音服務健康情況。','error'));
+  if(identity.role==='operator'){
+   const component=select(Object.entries(names)),state=select(Object.entries(states)),form=el('div',undefined,'import');
+   form.append(field('演練服務',component),field('演練狀態',state),button('送出合成狀態',async()=>{
+    await api('health',{component:component.value,state:state.value});await render();
+   }));pane.append(form);
+  }
+ }
  for (const c of data.components) {
   const row=el('div',undefined,'row'), title=el('div');
   title.append(el('h2',names[c.component]),el('p',c.updated_at ? '最後回報：'+new Date(c.updated_at*1000).toLocaleString() : '等待服務監測回報','small'));
@@ -196,6 +211,23 @@ function renderTrends(pane,data){
  pane.append(el('p',`有 ${data.unknown_import_dates} 場舊資料缺少匯入時間，未納入下表；刪除或到期後也不再計入。此表不是效率評分。`,'small'));
  pane.append(table(['匯入日期 UTC','會議數','累計分鐘','主席介入'],data.days.map(x=>[x.day,x.meetings,x.minutes,x.interventions])));
  if(!data.days.length)pane.append(el('p','尚無具匯入日期的資料，請先匯入合成事件檔。','empty'));
+}
+function renderAlertRules(pane,data){
+ pane.append(el('p','啟用後會立即檢查已有回報；異常或超過 5 分鐘未更新會產生通知。相同狀態不重複通知；無任何回報時不會推測故障。恢復正常僅通知，事故由人員確認結案。','small'));
+ for(const r of data.rules){
+  const row=el('div',undefined,'row');
+  row.append(el('strong',r.component),el('span',r.enabled?'已啟用':'已關閉'),button(r.enabled?'關閉規則':'啟用規則',async()=>{
+   await api('alert-rules',{component:r.component,enabled:!r.enabled});await render();
+  },'secondary'));pane.append(row);
+ }
+}
+function renderNotifications(pane,data){
+ const kinds={degraded:'效能下降',unavailable:'無法使用',unknown:'回報未知或已過期',recovered:'收到恢復正常回報'};
+ if(!data.entries.length)pane.append(el('p','目前沒有通知。需由管理員啟用規則，並有服務狀態回報。','empty'));
+ pane.append(table(['時間','服務','通知','狀態'],data.entries.map(n=>[new Date(n.at*1000).toLocaleString(),n.component,kinds[n.kind],n.is_read?'已讀':button('標示已讀',async()=>{
+  await api('notifications/'+n.id+'/read',{});await render();
+ },'secondary')])));
+ pane.append(el('p','通知保留 30 天；已讀狀態依每位使用者分開保存。','small'));paginate(pane,data);
 }
 function renderIncidents(pane,data){
  const component=select([['chair','主席判斷'],['discord','Discord'],['stt','即時轉錄'],['tts','主席語音']]),severity=select([['warning','警告'],['critical','嚴重']]);
